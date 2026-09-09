@@ -1,17 +1,29 @@
 import argparse
 import multiprocessing
 import os
+import secrets
 
 import uvicorn
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import Response
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 import worker_entrypoint
 from jobstore import ALLOWED_AUDIO_EXTENSIONS, JobStore
 
 
-def create_app(store: JobStore, job_queue) -> FastAPI:
-    app = FastAPI()
+def create_app(store: JobStore, job_queue, token: str | None = None) -> FastAPI:
+    security = HTTPBearer(auto_error=False)
+
+    def verify_token(
+        credentials: HTTPAuthorizationCredentials | None = Depends(security),
+    ) -> None:
+        if token is None:
+            return
+        if credentials is None or not secrets.compare_digest(credentials.credentials, token):
+            raise HTTPException(status_code=401, detail="Invalid or missing token")
+
+    app = FastAPI(dependencies=[Depends(verify_token)])
 
     @app.post("/jobs", status_code=202)
     async def create_job(
@@ -69,6 +81,7 @@ def main() -> None:
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--diarizer", default="msdd", choices=["msdd", "sortformer"])
     parser.add_argument("--jobs-dir", default="./jobs")
+    parser.add_argument("--token", default=None)
     args = parser.parse_args()
 
     store = JobStore(args.jobs_dir)
@@ -85,7 +98,7 @@ def main() -> None:
         process.start()
         workers.append(process)
 
-    app = create_app(store, job_queue)
+    app = create_app(store, job_queue, token=args.token)
     uvicorn.run(app, host=args.host, port=args.port)
 
 

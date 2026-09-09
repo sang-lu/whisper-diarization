@@ -100,8 +100,10 @@ If your system has enough VRAM (>=10GB), you can use `diarize_parallel.py` inste
 For programmatic / concurrent use, run the HTTP API server instead of the CLI:
 
 ```shell
-python api_server.py --max-parallel 1 --whisper-model medium.en --device cuda --diarizer msdd
+python api_server.py --max-parallel 1 --whisper-model medium.en --device cuda --diarizer msdd --token my-secret-token
 ```
+
+The `--token` argument is optional. If omitted, authentication remains disabled.
 
 `--max-parallel` controls how many audio files are transcribed at the same time; each
 unit of parallelism keeps its own copy of every model resident in memory, so raise it
@@ -112,21 +114,24 @@ FIFO queue and are picked up as capacity frees up.
 Submit a file:
 
 ```shell
-curl -X POST http://localhost:8000/jobs -F file=@audio.wav
+curl -H "Authorization: Bearer my-secret-token" \
+  -X POST http://localhost:8000/jobs -F file=@audio.wav
 # {"job_id": "...", "status": "queued"}
 ```
 
 Poll for the result:
 
 ```shell
-curl http://localhost:8000/jobs/<job_id>
+curl -H "Authorization: Bearer my-secret-token" \
+  http://localhost:8000/jobs/<job_id>
 # {"job_id": "...", "status": "completed", "result": {"text": "...", "utterances": [...]}}
 ```
 
 Delete a job's files once you're done with it:
 
 ```shell
-curl -X DELETE http://localhost:8000/jobs/<job_id>
+curl -H "Authorization: Bearer my-secret-token" \
+  -X DELETE http://localhost:8000/jobs/<job_id>
 ```
 
 ## Known Limitations

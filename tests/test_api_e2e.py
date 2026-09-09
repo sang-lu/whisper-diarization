@@ -9,6 +9,7 @@ import requests
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 AUDIO = os.path.join(REPO_ROOT, "tests", "assets", "test.opus")
+TOKEN = "e2e-test-secret"
 
 
 def _free_port() -> int:
@@ -17,11 +18,11 @@ def _free_port() -> int:
         return s.getsockname()[1]
 
 
-def _wait_for_server(base_url: str, timeout: float = 300.0) -> None:
+def _wait_for_server(base_url: str, headers=None, timeout: float = 300.0) -> None:
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:
-            requests.get(f"{base_url}/jobs/nonexistent-id", timeout=2)
+            requests.get(f"{base_url}/jobs/nonexistent-id", headers=headers, timeout=2)
             return
         except requests.exceptions.ConnectionError:
             time.sleep(1)
@@ -44,15 +45,18 @@ def test_end_to_end_transcription(tmp_path):
             "--diarizer", "sortformer",
             "--device", "cpu",
             "--jobs-dir", str(jobs_dir),
+            "--token", TOKEN,
         ],
     )
     try:
-        _wait_for_server(base_url)
+        headers = {"Authorization": f"Bearer {TOKEN}"}
+        _wait_for_server(base_url, headers=headers)
 
         with open(AUDIO, "rb") as f:
             response = requests.post(
                 f"{base_url}/jobs",
                 files={"file": ("test.opus", f, "audio/opus")},
+                headers=headers,
             )
         assert response.status_code == 202
         job_id = response.json()["job_id"]
@@ -60,7 +64,7 @@ def test_end_to_end_transcription(tmp_path):
         deadline = time.time() + 600
         result = None
         while time.time() < deadline:
-            poll = requests.get(f"{base_url}/jobs/{job_id}")
+            poll = requests.get(f"{base_url}/jobs/{job_id}", headers=headers)
             assert poll.status_code == 200
             body = poll.json()
             if body["status"] == "completed":

@@ -8,10 +8,10 @@ from api_server import create_app
 from jobstore import JobStore
 
 
-def _client(tmp_path):
+def _client(tmp_path, token=None):
     store = JobStore(str(tmp_path))
     job_queue = queue.Queue()
-    app = create_app(store, job_queue)
+    app = create_app(store, job_queue, token=token)
     return TestClient(app), store, job_queue
 
 
@@ -125,6 +125,70 @@ def test_delete_jobs_removes_job(tmp_path):
 def test_delete_jobs_unknown_id_returns_404(tmp_path):
     client, _store, _q = _client(tmp_path)
     response = client.delete("/jobs/does-not-exist")
+    assert response.status_code == 404
+
+
+def test_configured_token_rejects_missing_credentials_on_all_routes(tmp_path):
+    client, _store, _q = _client(tmp_path, token="server-secret")
+
+    post_response = client.post(
+        "/jobs",
+        files={"file": ("audio.wav", b"data", "audio/wav")},
+    )
+    get_response = client.get("/jobs/does-not-exist")
+    delete_response = client.delete("/jobs/does-not-exist")
+
+    assert post_response.status_code == 401
+    assert get_response.status_code == 401
+    assert delete_response.status_code == 401
+
+
+def test_configured_token_rejects_malformed_credentials(tmp_path):
+    client, _store, _q = _client(tmp_path, token="server-secret")
+
+    response = client.get(
+        "/jobs/does-not-exist",
+        headers={"Authorization": "Basic not-a-bearer-token"},
+    )
+
+    assert response.status_code == 401
+
+
+def test_configured_token_rejects_incorrect_credentials(tmp_path):
+    client, _store, _q = _client(tmp_path, token="server-secret")
+
+    response = client.get(
+        "/jobs/does-not-exist",
+        headers={"Authorization": "Bearer wrong-secret"},
+    )
+
+    assert response.status_code == 401
+
+
+def test_correct_token_allows_all_routes(tmp_path):
+    client, store, _q = _client(tmp_path, token="server-secret")
+    headers = {"Authorization": "Bearer server-secret"}
+
+    post_response = client.post(
+        "/jobs",
+        files={"file": ("audio.wav", b"data", "audio/wav")},
+        headers=headers,
+    )
+    job_id = post_response.json()["job_id"]
+    get_response = client.get(f"/jobs/{job_id}", headers=headers)
+    delete_response = client.delete(f"/jobs/{job_id}", headers=headers)
+
+    assert post_response.status_code == 202
+    assert get_response.status_code == 200
+    assert delete_response.status_code == 204
+    assert not store.job_exists(job_id)
+
+
+def test_no_configured_token_allows_request_without_authentication(tmp_path):
+    client, _store, _q = _client(tmp_path)
+
+    response = client.get("/jobs/does-not-exist")
+
     assert response.status_code == 404
 
 
