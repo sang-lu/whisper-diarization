@@ -67,6 +67,46 @@ python -m pip install "numpy<2" cython
 python -m pip install -c constraints.txt -r requirements.txt
 ```
 
+### GPU runtime for CUDA
+
+If you run Whisper with `--device cuda`, install the CUDA 12 user-space libraries
+required by `faster-whisper`/CTranslate2. A working NVIDIA driver shown by
+`nvidia-smi` is not enough; the Python process must also be able to load cuBLAS and
+cuDNN:
+
+```shell
+python -m pip install nvidia-cublas-cu12 'nvidia-cudnn-cu12==9.*'
+```
+
+Set the library path in the same shell before starting the API server or CLI:
+
+```shell
+CUDA_LIB_DIRS=$(python - <<'PY'
+import os
+import nvidia.cublas.lib
+import nvidia.cudnn.lib
+
+print(
+    os.path.dirname(nvidia.cublas.lib.__file__)
+    + ":"
+    + os.path.dirname(nvidia.cudnn.lib.__file__)
+)
+PY
+)
+export LD_LIBRARY_PATH="${CUDA_LIB_DIRS}:${LD_LIBRARY_PATH:-}"
+```
+
+Verify that the selected Whisper model can load on the GPU:
+
+```shell
+python - <<'PY'
+from faster_whisper import WhisperModel
+
+WhisperModel("large-v3-turbo", device="cuda", compute_type="float16")
+print("CUDA model load OK")
+PY
+```
+
 On other operating systems, install `SoX` using the platform's package manager. The
 `FFMPEG` installation examples are:
 
