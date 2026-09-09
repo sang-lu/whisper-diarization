@@ -60,6 +60,14 @@ jobs:
         python -m pip install torch torchaudio --index-url https://download.pytorch.org/whl/cpu
         uv pip install --system -c constraints.txt -r requirements.txt
 
+    - name: Install dev dependencies
+      run: |
+        uv pip install --system -r requirements-dev.txt
+
+    - name: Test API server (end-to-end)
+      run: |
+        python -m pytest tests/test_api_e2e.py tests/test_api_server.py tests/test_worker.py tests/test_schema.py tests/test_jobstore.py -v
+
     - name: Test with sortformer diarizer
       run: |
         python diarize.py -a "./tests/assets/test.opus" --whisper-model tiny.en --diarizer sortformer

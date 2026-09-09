@@ -1,39 +1,20 @@
 import argparse
 import logging
 import os
-import re
 
 import faster_whisper
 import torch
 
-from ctc_forced_aligner import (
-    generate_emissions,
-    get_alignments,
-    get_spans,
-    load_alignment_model,
-    postprocess_results,
-    preprocess_text,
-)
-from deepmultilingualpunctuation import PunctuationModel
-
+import pipeline
 from helpers import (
     cleanup,
-    find_numeral_symbol_tokens,
-    get_realigned_ws_mapping_with_punctuation,
-    get_sentences_speaker_mapping,
     get_speaker_aware_transcript,
-    get_words_speaker_mapping,
-    langs_to_iso,
     process_language_arg,
     punct_model_langs,
     whisper_langs,
     write_srt,
 )
 
-mtypes = {"cpu": "int8", "cuda": "float16"}
-
-temp_path = os.path.join(os.getcwd(), f"temp_outputs_{os.getpid()}")
-os.makedirs(temp_path, exist_ok=True)
 
 # Initialize parser
 parser = argparse.ArgumentParser()
@@ -83,7 +64,7 @@ parser.add_argument(
     "--device",
     dest="device",
     default="cuda" if torch.cuda.is_available() else "cpu",
-    help="if you have a GPU use 'cuda', otherwise 'cpu'",
+    help="if you have a GPU use 'cuda', otherwise use 'cpu'",
 )
 
 parser.add_argument(
@@ -96,144 +77,85 @@ parser.add_argument(
 args = parser.parse_args()
 language = process_language_arg(args.language, args.model_name)
 
+temp_path = os.path.join(os.getcwd(), f"temp_outputs_{os.getpid()}")
+os.makedirs(temp_path, exist_ok=True)
+
 if args.stemming:
-    # Isolate vocals from the rest of the audio
-
-    return_code = os.system(
-        f"python -m demucs.separate -n htdemucs --two-stems=vocals "
-        f'"{args.audio}" -o "{temp_path}" --device "{args.device}"'
-    )
-
-    if return_code != 0:
-        logging.warning(
-            "Source splitting failed, using original audio file. "
-            "Use --no-stem argument to disable it."
-        )
-        vocal_target = args.audio
-    else:
-        vocal_target = os.path.join(
-            temp_path,
-            "htdemucs",
-            os.path.splitext(os.path.basename(args.audio))[0],
-            "vocals.wav",
-        )
+    vocal_target = pipeline.separate_vocals(args.audio, temp_path, args.device)
 else:
     vocal_target = args.audio
 
-
-# Transcribe the audio file
-
-whisper_model = faster_whisper.WhisperModel(
-    args.model_name, device=args.device, compute_type=mtypes[args.device]
+# Transcribe
+models = pipeline.load_models(
+    args.model_name,
+    args.device,
+    load_alignment=False,
+    load_diarizer=False,
+    load_punct=False,
 )
-whisper_pipeline = faster_whisper.BatchedInferencePipeline(whisper_model)
 audio_waveform = faster_whisper.decode_audio(vocal_target)
-suppress_tokens = (
-    find_numeral_symbol_tokens(whisper_model.hf_tokenizer) if args.suppress_numerals else [-1]
+full_transcript, info = pipeline.transcribe(
+    models.whisper_model,
+    models.whisper_pipeline,
+    audio_waveform,
+    language=language,
+    suppress_numerals=args.suppress_numerals,
+    batch_size=args.batch_size,
 )
-
-if args.batch_size > 0:
-    transcript_segments, info = whisper_pipeline.transcribe(
-        audio_waveform,
-        language,
-        suppress_tokens=suppress_tokens,
-        batch_size=args.batch_size,
-    )
-else:
-    transcript_segments, info = whisper_model.transcribe(
-        audio_waveform,
-        language,
-        suppress_tokens=suppress_tokens,
-        vad_filter=True,
-    )
-
-full_transcript = "".join(segment.text for segment in transcript_segments)
-
-# clear gpu vram
-del whisper_model, whisper_pipeline
+del models
 torch.cuda.empty_cache()
 
 # Forced Alignment
-alignment_model, alignment_tokenizer = load_alignment_model(
+models = pipeline.load_models(
+    args.model_name,
     args.device,
-    dtype=torch.float16 if args.device == "cuda" else torch.float32,
+    load_whisper=False,
+    load_diarizer=False,
+    load_punct=False,
 )
-
-emissions, stride = generate_emissions(
-    alignment_model,
-    torch.from_numpy(audio_waveform).to(alignment_model.dtype).to(alignment_model.device),
-    batch_size=args.batch_size,
-)
-
-del alignment_model
-torch.cuda.empty_cache()
-
-tokens_starred, text_starred = preprocess_text(
+word_timestamps = pipeline.align(
+    models.alignment_model,
+    models.alignment_tokenizer,
+    audio_waveform,
     full_transcript,
-    romanize=True,
-    language=langs_to_iso[info.language],
+    info.language,
+    args.batch_size,
 )
-
-segments, scores, blank_token = get_alignments(
-    emissions,
-    tokens_starred,
-    alignment_tokenizer,
-)
-
-spans = get_spans(tokens_starred, segments, blank_token)
-
-word_timestamps = postprocess_results(text_starred, spans, stride, scores)
-
-if args.diarizer == "msdd":
-    from diarization import MSDDDiarizer
-
-    diarizer_model = MSDDDiarizer(device=args.device)
-
-elif args.diarizer == "sortformer":
-    from diarization import SortformerDiarizer
-
-    diarizer_model = SortformerDiarizer(device=args.device)
-
-speaker_ts = diarizer_model.diarize(torch.from_numpy(audio_waveform).unsqueeze(0))
-del diarizer_model
+del models
 torch.cuda.empty_cache()
 
-wsm = get_words_speaker_mapping(word_timestamps, speaker_ts, "start")
+# Diarization
+models = pipeline.load_models(
+    args.model_name,
+    args.device,
+    args.diarizer,
+    load_whisper=False,
+    load_alignment=False,
+    load_punct=False,
+)
+speaker_ts = pipeline.diarize(models.diarizer_model, audio_waveform)
+del models
+torch.cuda.empty_cache()
+
+wsm = pipeline.map_words(word_timestamps, speaker_ts)
 
 if info.language in punct_model_langs:
-    # restoring punctuation in the transcript to help realign the sentences
-    punct_model = PunctuationModel(model="kredor/punctuate-all")
-
-    words_list = list(map(lambda x: x["word"], wsm))
-
-    labled_words = punct_model.predict(words_list, chunk_size=230)
-
-    ending_puncts = ".?!"
-    model_puncts = ".,;:!?"
-
-    # We don't want to punctuate U.S.A. with a period. Right?
-    is_acronym = lambda x: re.fullmatch(r"\b(?:[a-zA-Z]\.){2,}", x)
-
-    for word_dict, labeled_tuple in zip(wsm, labled_words):
-        word = word_dict["word"]
-        if (
-            word
-            and labeled_tuple[1] in ending_puncts
-            and (word[-1] not in model_puncts or is_acronym(word))
-        ):
-            word += labeled_tuple[1]
-            if word.endswith(".."):
-                word = word.rstrip(".")
-            word_dict["word"] = word
-
+    models = pipeline.load_models(
+        args.model_name,
+        args.device,
+        load_whisper=False,
+        load_alignment=False,
+        load_diarizer=False,
+    )
+    wsm = pipeline.restore_punctuation(models.punct_model, wsm, info.language)
+    del models
 else:
     logging.warning(
         f"Punctuation restoration is not available for {info.language} language."
         " Using the original punctuation."
     )
 
-wsm = get_realigned_ws_mapping_with_punctuation(wsm)
-ssm = get_sentences_speaker_mapping(wsm, speaker_ts)
+wsm, ssm = pipeline.finalize_mappings(wsm, speaker_ts)
 
 with open(f"{os.path.splitext(args.audio)[0]}.txt", "w", encoding="utf-8-sig") as f:
     get_speaker_aware_transcript(ssm, f)
