@@ -4,7 +4,7 @@
 
 **Goal:** Add an HTTP API server that accepts audio uploads, runs the existing Whisper+NeMo diarization pipeline, and returns AssemblyAI-shaped JSON, with a configurable cap on parallel jobs and FIFO queuing beyond that cap.
 
-**Architecture:** Extract the pipeline in `diarize.py` into reusable stage functions in a new `pipeline.py` (transcribe, align, diarize, restore_punctuation, map/finalize mappings), keeping `diarize.py`'s per-stage load/delete/empty_cache VRAM behavior unchanged. A new `api_server.py` (FastAPI, single process, never touches CUDA) manages job files on disk and a `multiprocessing.Queue`; N `worker.py` processes (spawned once, one per `--max-parallel`) each load the full model stack once and keep it resident, pulling job IDs off the queue and writing `status.json`/`result.json` atomically.
+**Architecture:** Extract the pipeline in `diarize.py` into reusable stage functions in a new `pipeline.py` (transcribe, align, diarize, restore_punctuation, map/finalize mappings), keeping `diarize.py`'s per-stage load/delete/empty_cache VRAM behavior unchanged. A new `api_server.py` (FastAPI, single process, never touches CUDA — not even transitively, via a lazy-import `worker_entrypoint.py`) manages job files on disk and a `multiprocessing.Queue`; N `worker.py` processes (spawned once, one per `--max-parallel`) each load the full model stack once and keep it resident, pulling job IDs off the queue and writing `status.json`/`result.json` atomically.
 
 **Tech Stack:** FastAPI, Uvicorn, python-multipart (upload parsing), pytest + httpx (`TestClient`) for tests. No new production dependencies beyond these three.
 
@@ -13,7 +13,7 @@
 ## Global Constraints
 
 - CLI behavior of `diarize.py` / `diarize_parallel.py` must not change — same output files, same peak VRAM profile (max of one stage at a time, via `del` + `torch.cuda.empty_cache()` between stages). (Spec §3, §5.1)
-- API server process (`api_server.py`, FastAPI/uvicorn) must never import `torch`/`faster_whisper`/model code directly — only `worker.py` (running in spawned subprocesses) touches models. (Spec §4)
+- API server process (`api_server.py`, FastAPI/uvicorn) must never import `torch`/`faster_whisper`/model code, even transitively — no module it imports at top level may import `worker.py` at top level either, since `worker.py` imports those. Model code loads only inside a spawned worker process, via `worker_entrypoint.py`'s deferred import (Task 5). (Spec §4)
 - Worker processes use `multiprocessing.get_context("spawn")`, not `fork`. (Spec §4)
 - Job state (`status.json`, `result.json`) lives on disk under `jobs/{job_id}/`, written atomically via a `.tmp` file + `os.replace()` — never written in place. (Spec §4, §9)
 - API default `no_stem=true` (opposite of the CLI's `stemming=True` default). (Spec §6)
@@ -1116,17 +1116,34 @@ EOF
 
 ## Task 5: FastAPI app (`/jobs` endpoints) with an injectable queue for tests
 
+**`worker.py` (Task 4) imports `faster_whisper` and `pipeline` (which imports `torch`) at module
+level — that's fine for a module that only ever runs inside a spawned worker process. But
+`api_server.py` is the module that becomes the FastAPI/uvicorn process, and the global
+constraint says that process must never import `torch`/`faster_whisper`/model code, even
+transitively. A plain top-level `from worker import worker_loop` in `api_server.py` would
+violate that the moment `api_server.py` is imported — before any spawning even happens.**
+
+The fix: a tiny `worker_entrypoint.py` module whose only top-level content is a function that
+imports `worker` **inside its body**. `multiprocessing`'s `spawn` context pickles a `Process`
+target by module + qualified name, not by value — so the parent only ever needs a reference to
+`worker_entrypoint.run`, and the `from worker import worker_loop` inside it only executes when a
+*child* process actually calls the function. The parent process (`api_server.py` and everything
+it imports at module level) never imports `worker`, `pipeline`, `faster_whisper`, or `torch`.
+
 **Files:**
+- Create: `worker_entrypoint.py`
 - Create: `api_server.py`
 - Modify: `requirements.txt`
 - Create: `requirements-dev.txt`
 - Test: `tests/test_api_server.py`
 
 **Interfaces:**
-- Consumes: `jobstore.JobStore` (Task 2), `worker.worker_loop` (Task 4, used only in `main()`, not in the tests for this task).
+- Consumes: `jobstore.JobStore` (Task 2). Does **not** import `worker` at module level anywhere
+  in `api_server.py` — only `worker_entrypoint.run` (see below), used solely inside `main()`.
 - Produces (used by Task 6):
+  - `worker_entrypoint.run(job_queue, jobs_dir: str, whisper_model_name: str, device: str, diarizer: str) -> None` — the only line at import time is `def run(...):`; the body does `from worker import worker_loop` then calls it with the same arguments. This is the multiprocessing `Process` target.
   - `api_server.create_app(store: jobstore.JobStore, job_queue) -> fastapi.FastAPI` — `job_queue` only needs a `.put(item)` method, so tests can pass a plain `queue.Queue()` instead of a real `multiprocessing.Queue`.
-  - `api_server.main() -> None` — parses `--host`, `--port`, `--max-parallel` (default `1`), `--whisper-model`, `--device`, `--diarizer`, `--jobs-dir` (default `./jobs`); creates the jobs dir; creates a `multiprocessing.get_context("spawn").Queue()`; starts `--max-parallel` `worker.worker_loop` processes; builds the app via `create_app`; runs `uvicorn.run(app, host=..., port=...)`.
+  - `api_server.main() -> None` — parses `--host`, `--port`, `--max-parallel` (default `1`), `--whisper-model`, `--device`, `--diarizer`, `--jobs-dir` (default `./jobs`); creates the jobs dir; creates a `multiprocessing.get_context("spawn").Queue()`; starts `--max-parallel` processes with `target=worker_entrypoint.run`; builds the app via `create_app`; runs `uvicorn.run(app, host=..., port=...)`.
 
 **Step 1: Write the failing tests**
 
@@ -1292,7 +1309,22 @@ Run: `pip install -r requirements-dev.txt`
 
 - [ ] Updated `requirements.txt`, created `requirements-dev.txt`, installed.
 
-**Step 4: Implement `api_server.py`**
+**Step 4: Implement `worker_entrypoint.py`**
+
+This file must have **no top-level imports beyond the standard library** — the `from worker
+import worker_loop` line only runs when `run()` is actually called, which only happens inside a
+spawned child process:
+
+```python
+def run(job_queue, jobs_dir: str, whisper_model_name: str, device: str, diarizer: str) -> None:
+    from worker import worker_loop
+
+    worker_loop(job_queue, jobs_dir, whisper_model_name, device, diarizer)
+```
+
+- [ ] Create `worker_entrypoint.py` as above.
+
+**Step 5: Implement `api_server.py`**
 
 ```python
 import argparse
@@ -1303,8 +1335,8 @@ import uvicorn
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import Response
 
+import worker_entrypoint
 from jobstore import ALLOWED_AUDIO_EXTENSIONS, JobStore
-from worker import worker_loop
 
 
 def create_app(store: JobStore, job_queue) -> FastAPI:
@@ -1375,7 +1407,7 @@ def main() -> None:
     workers = []
     for _ in range(args.max_parallel):
         p = ctx.Process(
-            target=worker_loop,
+            target=worker_entrypoint.run,
             args=(job_queue, args.jobs_dir, args.whisper_model, args.device, args.diarizer),
             daemon=True,
         )
@@ -1392,29 +1424,65 @@ if __name__ == "__main__":
 
 - [ ] Implement `api_server.py` as above.
 
-**Step 5: Run tests to verify they pass**
+**Step 6: Write and run a regression test locking the no-model-imports constraint**
+
+This is the test that would have caught the original bug (`api_server.py` importing `worker`
+directly, which imports `torch` transitively). Run it in a subprocess so it reflects a genuinely
+fresh interpreter, not whatever other test modules already happened to import into the current
+process's `sys.modules`. Append to `tests/test_api_server.py`:
+
+```python
+import subprocess
+import sys
+
+
+def test_importing_api_server_does_not_import_torch_or_model_code():
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import api_server, sys\n"
+            "leaked = {'torch', 'faster_whisper', 'pipeline', 'worker'} & set(sys.modules)\n"
+            "assert not leaked, f'api_server.py pulled in: {leaked}'\n",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+```
+
+Run: `python -m pytest tests/test_api_server.py -v -k no_model_imports`
+Expected: PASS. If it fails, something in `api_server.py`'s import chain (including
+`worker_entrypoint.py`) is importing model code at module level — check for an accidental
+top-level `from worker import ...` before checking anything else.
+
+- [ ] Write and run this test; confirm PASS.
+
+**Step 7: Run all `test_api_server.py` tests**
 
 Run: `python -m pytest tests/test_api_server.py -v`
 Expected: PASS (all tests)
 
 - [ ] Ran and confirmed PASS.
 
-**Step 6: Run ruff**
+**Step 8: Run ruff**
 
-Run: `ruff check api_server.py worker.py jobstore.py schema.py pipeline.py`
+Run: `ruff check api_server.py worker_entrypoint.py worker.py jobstore.py schema.py pipeline.py`
 Expected: no errors.
 
 - [ ] Ran and confirmed clean.
 
-**Step 7: Commit**
+**Step 9: Commit**
 
 ```bash
-git add api_server.py requirements.txt requirements-dev.txt tests/test_api_server.py
+git add api_server.py worker_entrypoint.py requirements.txt requirements-dev.txt tests/test_api_server.py
 git commit -m "$(cat <<'EOF'
 Add FastAPI job submission/status/delete endpoints
 
 create_app takes an injectable queue so route logic is tested without
-spawning real worker processes or loading any models.
+spawning real worker processes or loading any models. worker_entrypoint.py
+defers the `from worker import worker_loop` import to inside the spawned
+child process, so api_server.py itself never imports torch/faster_whisper.
 
 Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_018SMjqPYv94DjiiCHtk6pbL

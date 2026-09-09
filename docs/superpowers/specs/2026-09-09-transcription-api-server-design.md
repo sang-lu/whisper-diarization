@@ -64,9 +64,15 @@ processed in parallel, with the rest queued.
                        - result.json (on success)
 ```
 
-- The FastAPI process never touches CUDA/torch; it only manages HTTP,
-  files, and the queue. This keeps the async event loop responsive
-  regardless of how long GPU work takes.
+- The FastAPI process never touches CUDA/torch **at the import level, not
+  just at runtime** — `api_server.py` must not import `worker.py` directly,
+  since `worker.py` imports `pipeline.py`, which imports `torch`. A small
+  `worker_entrypoint.py` module (§5.3) breaks that chain: its only
+  top-level content is a function whose body does `from worker import
+  worker_loop`, so the import happens inside the spawned child process
+  when the function runs, never in the parent. This keeps the async event
+  loop responsive regardless of how long GPU work takes, and keeps torch
+  out of the FastAPI process's memory entirely.
 - Worker processes are started with `multiprocessing.get_context("spawn")`
   (required for CUDA — `fork` after CUDA init is unsafe) by the launcher
   script before uvicorn starts serving.
@@ -118,12 +124,33 @@ The launcher + FastAPI app:
   `--whisper-model`, `--device`, `--diarizer`, `--jobs-dir` (default
   `./jobs`).
 - On startup: creates the jobs directory, creates a
-  `multiprocessing.Queue`, starts `--max-parallel` worker processes (each
-  running `worker.worker_loop(queue, jobs_dir, whisper_model, device,
-  diarizer)`), then runs uvicorn.
+  `multiprocessing.Queue`, starts `--max-parallel` worker processes with
+  `target=worker_entrypoint.run` (see §5.3), then runs uvicorn.
 - Routes (see §6).
+- `api_server.py` itself imports only `jobstore` and `worker_entrypoint`
+  (plus FastAPI/uvicorn/stdlib) — it must never import `worker` or
+  `pipeline` directly.
 
-### 5.3 `worker.py` (new)
+### 5.3 `worker_entrypoint.py` (new)
+
+A one-function module with no top-level imports beyond the standard
+library:
+
+```python
+def run(job_queue, jobs_dir, whisper_model_name, device, diarizer):
+    from worker import worker_loop
+
+    worker_loop(job_queue, jobs_dir, whisper_model_name, device, diarizer)
+```
+
+This is the actual `multiprocessing.Process(target=...)` passed from
+`api_server.py`. Since `multiprocessing`'s `spawn` context resolves a
+`Process` target by module + qualified name and only calls it inside the
+freshly-started child interpreter, the `from worker import worker_loop`
+line — and everything it drags in (`pipeline`, `faster_whisper`, `torch`)
+— never executes in the parent (FastAPI/uvicorn) process.
+
+### 5.4 `worker.py` (new)
 
 - `worker_loop(queue, jobs_dir, whisper_model, device, diarizer)`:
   calls `pipeline.load_models(...)` once (all four models), then loops
@@ -295,6 +322,11 @@ utterance per speaker turn, not per sentence):
 - Wire this into `.github/workflows/test_run.yml` alongside the existing
   CLI-based checks (`tiny.en`, both diarizers), on CPU, same as today's
   CLI tests.
+- A separate, fast regression test asserts the import boundary from §4/§5.2
+  directly: run `python -c "import api_server"` in a fresh subprocess and
+  assert `torch`, `faster_whisper`, `pipeline`, and `worker` are absent
+  from `sys.modules` afterward. This is what would have caught
+  `api_server.py` importing `worker` at module level.
 
 ## 11. Future Work (explicitly out of scope for this spec)
 
