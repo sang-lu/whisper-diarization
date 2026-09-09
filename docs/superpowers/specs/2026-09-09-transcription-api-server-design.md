@@ -80,23 +80,35 @@ processed in parallel, with the rest queued.
 
 ### 5.1 `pipeline.py` (new)
 
-Extracted from `diarize.py`. Two entry points:
+Extracted from `diarize.py`, as **stage functions** rather than one
+monolithic `run_pipeline`, so the CLI and the API server can each control
+model lifetime independently:
 
 - `load_models(whisper_model_name, device, diarizer) -> Models`
   Loads the Whisper model, alignment model, diarizer model, and
-  punctuation model once. Returns a small dataclass/namedtuple bundling
-  them. This is the expensive, one-time-per-worker call.
+  punctuation model. Returns a small dataclass bundling them. Any subset
+  of these fields may be `None` — see below.
+- `transcribe(whisper_model, whisper_pipeline, audio_waveform, *, language, suppress_numerals, batch_size) -> (full_transcript, info)`
+- `align(alignment_model, alignment_tokenizer, audio_waveform, full_transcript, language, batch_size) -> word_timestamps`
+- `diarize(diarizer_model, audio_waveform) -> speaker_ts`
+- `restore_punctuation(punct_model, wsm, language) -> wsm` (no-op passthrough if `language not in punct_model_langs`)
+- `build_mappings(word_timestamps, speaker_ts) -> (wsm, ssm)` (wraps the
+  existing `helpers.get_words_speaker_mapping` +
+  `get_realigned_ws_mapping_with_punctuation` +
+  `get_sentences_speaker_mapping` calls)
 
-- `run_pipeline(models, audio_path, *, language=None, stemming=True, suppress_numerals=False, batch_size=8) -> PipelineResult`
-  Runs stemming → transcription → forced alignment → diarization →
-  punctuation restoration → word/sentence speaker mapping, using the
-  already-loaded `models`. Returns the same kind of structure `diarize.py`
-  currently derives (`wsm`, `ssm`, detected language, audio duration) so
-  both the CLI and the API server can build their own output format from
-  it.
+**`diarize.py` keeps its current memory profile.** It still calls
+`load_models()` for one stage at a time (e.g. `load_models(name, device,
+diarizer=None)` to get only the Whisper models), uses it, `del`s it, and
+calls `empty_cache()`, exactly as today — it just calls the extracted
+stage functions instead of inlining the code. Peak VRAM for the CLI stays
+`max(whisper, alignment, diarizer)`, unchanged from today.
 
-`diarize.py` is updated to call `load_models()` once then `run_pipeline()`
-once, instead of inlining the logic — behavior unchanged.
+**The API server's `worker.py` calls `load_models()` once with everything
+populated**, then calls the stage functions per job without ever
+`del`-ing. This means, unlike the CLI, a worker's peak VRAM is
+`whisper + alignment + diarizer + punctuation` resident simultaneously —
+see §8 for the sizing implication.
 
 ### 5.2 `api_server.py` (new)
 
@@ -114,11 +126,12 @@ The launcher + FastAPI app:
 ### 5.3 `worker.py` (new)
 
 - `worker_loop(queue, jobs_dir, whisper_model, device, diarizer)`:
-  calls `pipeline.load_models(...)` once, then loops forever:
-  `job_id = queue.get()` → read `jobs/{job_id}/params.json` → write
-  `status.json = {"status": "processing"}` → call `run_pipeline` → convert
-  result to the output schema (§7) → write `result.json` → write
-  `status.json = {"status": "completed"}`. On exception, writes
+  calls `pipeline.load_models(...)` once (all four models), then loops
+  forever: `job_id = queue.get()` → read `jobs/{job_id}/params.json` →
+  write `status.json` (atomically, see §9) as `{"status": "processing"}`
+  → run the stage functions from §5.1 in sequence → convert the resulting
+  `wsm` to the output schema (§7) → write `result.json` and `status.json`
+  (`{"status": "completed"}`), both atomically. On exception, writes
   `status.json = {"status": "failed", "error": "<message>"}` and continues
   the loop (one bad file must not kill the worker).
 
@@ -129,9 +142,19 @@ The launcher + FastAPI app:
 Multipart form:
 - `file` (required): the audio file.
 - `language` (optional): same choices as CLI `--language`.
-- `no_stem` (optional bool, default `false`).
+- `no_stem` (optional bool, default `true`). Default is `true` (unlike the
+  CLI's `stemming=True` default) because stemming shells out to a
+  separate `demucs` process per job — see §8 for why that matters under
+  concurrency. Callers that want source separation opt in explicitly.
 - `suppress_numerals` (optional bool, default `false`).
 - `batch_size` (optional int, default `8`).
+
+The uploaded file is saved to `jobs/{job_id}/audio<ext>`, where `ext` is
+taken from an allowlist derived from the upload's declared content-type /
+filename suffix (`.wav`, `.mp3`, `.flac`, `.ogg`, `.opus`, `.m4a`, `.mp4`,
+`.webm`) — never the raw client-supplied filename, which is discarded
+after extension extraction. This avoids passing untrusted path
+components into the stemming subprocess call.
 
 Response `202 Accepted`:
 ```json
@@ -164,7 +187,7 @@ rather than emitted as `null`:
   "id": "b3f1...",
   "status": "completed",
   "language_code": "en",
-  "audio_duration": 260.4,
+  "audio_duration": 260,
   "text": "full transcript text...",
   "utterances": [
     {
@@ -180,24 +203,59 @@ rather than emitted as `null`:
 }
 ```
 
-Notes:
+Notes (verified against the reference `assemblyai.json`, where
+`len(utterances) == len(itertools.groupby(words, key=speaker))`, i.e. one
+utterance per speaker turn, not per sentence):
+- **`utterances` are built by grouping `wsm` (word-speaker mapping) on
+  speaker change only** — a new utterance starts whenever
+  `word["speaker"] != previous_word["speaker"]`. This does **not** use
+  `ssm` (`helpers.get_sentences_speaker_mapping`), because `ssm` also
+  splits mid-turn on sentence boundaries and would produce far more,
+  shorter utterances than AssemblyAI's format does. `ssm` remains used
+  only by the CLI's existing `.txt`/`.srt` output, which is unaffected by
+  this spec.
+  - Each utterance's `start`/`end` are the first word's `start_time` and
+    last word's `end_time` in its group.
+  - Each utterance's `text` is its words joined with `" "`.
+  - Each utterance's `words` list is exactly the grouped `wsm` entries,
+    mapped to `{"text": w["word"], "start": w["start_time"], "end": w["end_time"], "speaker": <letter>}`.
+- **Speaker letters**: `wsm`/`ssm` speaker values are the diarizer's raw
+  int IDs (not necessarily `0, 1, 2...` contiguous or first-seen-ordered).
+  Assign `"A", "B", "C"...` **by order of first appearance** while
+  scanning `wsm` — i.e. the first distinct speaker ID encountered becomes
+  `"A"`, the second distinct ID becomes `"B"`, etc. — matching AssemblyAI's
+  convention, not `chr(ord("A") + speaker_id)`.
+- **`text`** (top-level) is the join of the *final*, post-punctuation,
+  post-realignment `wsm` words (`" ".join(w["word"] for w in wsm)`) — not
+  `full_transcript` from the raw Whisper output, which predates
+  punctuation restoration and word realignment and will not match the
+  concatenation of `words`/`utterances`.
+- **`audio_duration`** is an integer number of seconds
+  (`int(len(audio_waveform) / 16000)`), matching the reference file's
+  `260` (not `260.4`).
 - `start`/`end` are milliseconds, matching AssemblyAI and matching what
   `helpers.get_words_speaker_mapping` already computes.
-- Speaker labels are remapped from the pipeline's `0, 1, 2...` to
-  `"A", "B", "C"...` to match AssemblyAI convention.
 - No `confidence`/`channel` fields — this pipeline doesn't produce
   per-word confidence scores or multi-channel audio.
-- `utterances` is built directly from `ssm` (sentence speaker mapping);
-  each utterance's `words` slice comes from the corresponding `wsm`
-  entries.
 
 ## 8. Concurrency & Configuration
 
 - `--max-parallel` (default `1`) = number of worker processes = number of
-  resident copies of the full model stack. Given the target deployment
-  (single shared 48GB GPU, other workloads running on it), the default of
-  `1` is intentionally conservative; operators raise it only if they've
-  confirmed enough free VRAM for N copies.
+  resident copies of the full model stack. As noted in §5.1, each worker
+  keeps **all four models loaded simultaneously** (no `del`/`empty_cache`
+  between stages, unlike the CLI), so peak VRAM is approximately:
+  `--max-parallel × (whisper_model_vram + alignment_model_vram + diarizer_vram + punct_model_vram)`.
+  Given the target deployment (single shared 48GB GPU, other workloads
+  already running on it), the default of `1` is intentionally
+  conservative; operators raise it only after confirming enough free
+  VRAM for N copies using this formula.
+- If a job has `no_stem=false` (source separation enabled), the worker's
+  stemming stage shells out to a separate `python -m demucs.separate`
+  process, which loads its own model into GPU memory **outside** the
+  worker-process accounting above. With `--max-parallel > 1`, up to N such
+  demucs processes can run concurrently, each adding to peak VRAM. This is
+  why the API default is `no_stem=true` (§6) — operators who need stemming
+  under high concurrency must account for this separately.
 - Requests beyond the running jobs simply sit in the `multiprocessing.Queue`
   (FIFO) — no additional queue library needed.
 - `--whisper-model`, `--device`, `--diarizer` are fixed for the server's
@@ -206,8 +264,8 @@ Notes:
 
 ## 9. Error Handling
 
-- Upload validation: reject unreadable/empty files with `400` before
-  queuing.
+- Upload validation: reject unreadable/empty files, or files whose
+  extension isn't in the allowlist (§6), with `400` before queuing.
 - Pipeline failures (bad audio, OOM, unsupported language, etc.) are
   caught in the worker loop per job and reported via `status.json`
   (`"failed"` + message) — never crash the worker process itself.
@@ -215,6 +273,16 @@ Notes:
   pulled off the queue stay `"processing"` forever; that failure mode is
   accepted for v1 (documented as a known limitation) rather than adding
   a heartbeat/watchdog now.
+- **Atomic status/result writes**: `status.json` and `result.json` are
+  never written in place. Each write goes to a sibling temp file
+  (`status.json.tmp` / `result.json.tmp`) which is then moved into place
+  with `os.replace()` (atomic on POSIX and Windows). This prevents a
+  `GET /jobs/{id}` poll from ever reading a partially-written file and
+  getting a JSON decode error / 500.
+- The stemming subprocess call is built with `subprocess.run([...])`
+  (argument list, `shell=False`), not a `os.system(f"...")` shell string,
+  since the audio path now originates from an HTTP upload rather than a
+  trusted CLI argument.
 
 ## 10. Testing
 
